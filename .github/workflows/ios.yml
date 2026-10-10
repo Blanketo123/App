@@ -1,0 +1,99 @@
+name: App bauen und an TestFlight schicken
+
+# Baut auf einem geliehenen Mac bei GitHub. Signiert wird mit einem
+# App-Store-Connect-Schlüssel, deshalb ist weder ein eigener Mac noch ein
+# Zertifikat von Hand nötig.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  bauen:
+    runs-on: macos-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Neuestes Xcode wählen
+        run: |
+          # Fest verdrahtete Version bricht, sobald GitHub das Abbild dreht
+          NEUSTES=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "nehme $NEUSTES"
+          sudo xcode-select -s "$NEUSTES"
+          xcodebuild -version
+
+      - name: Schlüssel ablegen
+        env:
+          KEY: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p ~/private_keys
+          echo "$KEY" > ~/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+      - name: Baunummer setzen
+        # Jede TestFlight-Lieferung braucht eine höhere Nummer als die davor
+        run: echo "BUILD=$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+
+      - name: Archivieren
+        # Bewusst OHNE Signatur: signiert wird erst beim Exportieren. Sonst legt Xcode bei
+        # jedem Lauf ein neues Entwickler-Zertifikat an und rennt nach ein paar Bauläufen
+        # in Apples Obergrenze ("Your account has reached the maximum number of certificates").
+        run: |
+          xcodebuild archive \
+            -project TrialApp.xcodeproj \
+            -scheme TrialApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/TrialApp.xcarchive \
+            DEVELOPMENT_TEAM=${{ secrets.TEAM_ID }} \
+            CURRENT_PROJECT_VERSION=$BUILD \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Exportieren
+        run: |
+          # teamID muss hier stehen: das Archiv ist unsigniert, also steckt kein Team darin
+          cat > export.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>${{ secrets.TEAM_ID }}</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath build/TrialApp.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist export.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8 \
+            -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
+            -authenticationKeyIssuerID ${{ secrets.ASC_ISSUER_ID }}
+
+      - name: An TestFlight schicken
+        run: |
+          set +e
+          AUSGABE=$(xcrun altool --upload-app -f build/export/TrialApp.ipa -t ios \
+            --apiKey ${{ secrets.ASC_KEY_ID }} \
+            --apiIssuer ${{ secrets.ASC_ISSUER_ID }} 2>&1)
+          CODE=$?
+          echo "$AUSGABE"
+          [ $CODE -eq 0 ] && exit 0
+          # Apple quittiert einen erfolgreichen Upload regelmäßig mit 409 auf 'buildUpload'.
+          # Der Build liegt danach trotzdem in TestFlight — geprüft am 4.9.2026.
+          if echo "$AUSGABE" | grep -q "buildUpload"; then
+            echo "Hinweis: 409 auf buildUpload nach erfolgreichem Upload — wird ignoriert."
+            exit 0
+          fi
+          exit $CODE
+
+      - name: IPA auch als Datei behalten
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrialApp-ipa
+          path: build/export/*.ipa
